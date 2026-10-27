@@ -1,4 +1,5 @@
 use super::Ack;
+use bytes::Bytes;
 use slab::Slab;
 use tracing::{info, trace};
 
@@ -25,7 +26,11 @@ pub struct PublishData {
 }
 
 impl From<PubWithProp> for PublishData {
-    fn from((publish, properties): PubWithProp) -> Self {
+    fn from((mut publish, properties): PubWithProp) -> Self {
+        // Decoder slices share the receive allocation. Long-lived logs should
+        // retain only the packet bytes, rather than pinning the entire buffer.
+        publish.topic = Bytes::copy_from_slice(&publish.topic);
+        publish.payload = Bytes::copy_from_slice(&publish.payload);
         PublishData {
             publish,
             properties,
@@ -39,7 +44,7 @@ impl Storage for PublishData {
     // TODO: calculate size of publish properties as well!
     fn size(&self) -> usize {
         let publish = &self.publish;
-        4 + publish.topic.len() + publish.payload.len()
+        std::mem::size_of::<Self>() + publish.topic.len() + publish.payload.len()
     }
 }
 
@@ -437,6 +442,53 @@ mod test {
     use super::DataLog;
     use crate::router::shared_subs::Strategy;
     use crate::RouterConfig;
+
+    #[test]
+    fn stored_publish_releases_receive_allocation() {
+        use super::PublishData;
+        use crate::protocol::Publish;
+        use bytes::BytesMut;
+
+        let mut receive = BytesMut::with_capacity(64 * 1024);
+        receive.extend_from_slice(b"topic/datax");
+        let receive = receive.freeze();
+        let mut publish = Publish::new("unused", "", false);
+        publish.topic = receive.slice(..10);
+        publish.payload = receive.slice(10..);
+        let stored = PublishData::from((publish, None));
+        assert!(
+            receive.is_unique(),
+            "stored slices still pin the receive buffer"
+        );
+        assert_eq!(stored.publish.topic.as_ref(), b"topic/data");
+        assert_eq!(stored.publish.payload.as_ref(), b"x");
+    }
+
+    #[test]
+    fn tiny_publish_history_rotates_with_metadata_budget() {
+        use super::{Data, PublishData};
+        use crate::protocol::Publish;
+        use std::collections::VecDeque;
+
+        let config = RouterConfig {
+            max_segment_size: 1024,
+            max_segment_count: 2,
+            ..Default::default()
+        };
+        let mut data = Data::<PublishData>::new("health", &config);
+        let mut notifications = VecDeque::new();
+        for _ in 0..10_000 {
+            data.append(
+                (Publish::new("health", "x", false), None).into(),
+                &mut notifications,
+            );
+        }
+        let mut stored = Vec::new();
+        data.log.readv((0, 0), u64::MAX, &mut stored).unwrap();
+        let entry_size = std::mem::size_of::<PublishData>() + 7;
+        assert!(stored.len() <= 2 * (1024 / entry_size + 1));
+        assert_eq!(data.meter.count, 10_000);
+    }
 
     #[test]
     fn publish_filters_updating_correctly_on_new_topic_subscription() {
